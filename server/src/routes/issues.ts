@@ -1228,6 +1228,30 @@ export function issueRoutes(db: Db, storage: StorageService) {
       }
 
       if (commentBody && comment) {
+        // Wake the assignee when a board user comments on their issue.
+        if (
+          actor.actorType === "user" &&
+          issue.assigneeAgentId &&
+          !wakeups.has(issue.assigneeAgentId)
+        ) {
+          wakeups.set(issue.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_comment_from_board",
+            payload: { issueId: id, commentId: comment.id },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: id,
+              taskId: id,
+              commentId: comment.id,
+              wakeCommentId: comment.id,
+              wakeReason: "issue_comment_from_board",
+              source: "comment.board_user",
+            },
+          });
+        }
+
         let mentionedIds: string[] = [];
         try {
           mentionedIds = await svc.findMentionedAgents(issue.companyId, commentBody);
