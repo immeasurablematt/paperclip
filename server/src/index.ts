@@ -423,7 +423,7 @@ export async function startServer(): Promise<StartedServer> {
     startupDbInfo = { mode: "embedded-postgres", dataDir, port };
   }
   
-  if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host)) {
+  if (config.deploymentMode === "local_trusted" && !isLoopbackHost(config.host) && !process.env.PAPERCLIP_ALLOW_TAILSCALE_TRUSTED) {
     throw new Error(
       `local_trusted mode requires loopback host binding (received: ${config.host}). ` +
         "Use authenticated mode for non-loopback deployments.",
