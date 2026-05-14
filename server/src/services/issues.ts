@@ -113,8 +113,9 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
 };
 
 function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
+  if (!checkoutRunId) return true; // No checkout lock — any run from the assignee is allowed
   if (actorRunId) return checkoutRunId === actorRunId;
-  return checkoutRunId == null;
+  return false;
 }
 
 const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out"]);

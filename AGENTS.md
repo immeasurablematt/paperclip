@@ -20,6 +20,16 @@ Before making changes, read in this order:
 `doc/SPEC.md` is long-horizon product context.
 `doc/SPEC-implementation.md` is the concrete V1 build contract.
 
+## 2A. Workspace Root Policy
+
+- New build repos on this machine belong under `~/Projects`
+- Prefer `~/Projects/clients/<client>/<project>`, `products/`, `tools/`, `personal/`, or `labs/`
+- `~/ops`, `~/remember`, `~/.openclaw`, `~/.paperclip`, `~/.claude`, and `~/.codex` are valid system roots
+- Never treat `~/Desktop`, `~/Downloads`, or `~/Documents` as permanent project roots
+- If a project uses GSD, the main spec path should be `.planning/spec.md`
+- If duplicate roots exist, stop and confirm the canonical path before moving or editing across both
+- Source of truth: `~/ops/workspace/workspace-system.md`
+
 ## 3. Repo Map
 
 - `server/`: Express REST API and orchestration services
