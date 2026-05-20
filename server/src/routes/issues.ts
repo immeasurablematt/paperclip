@@ -1149,8 +1149,9 @@ export function issueRoutes(
     const hasStructuredFields = input.presentation !== undefined || input.metadata !== undefined;
     if (!hasStructuredFields) return true;
     if (req.actor.type === "board") return true;
+    if (req.actor.type === "agent") return true;
     res.status(403).json({
-      error: "Only board users may set structured comment presentation or metadata",
+      error: "Only board users and agents may set structured comment presentation or metadata",
       details: {
         securityPrinciples: ["Least Privilege", "Secure Defaults", "Complete Mediation"],
       },

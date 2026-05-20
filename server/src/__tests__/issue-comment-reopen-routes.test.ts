@@ -611,23 +611,51 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
-  it("rejects structured comment presentation fields from agent-authenticated writes", async () => {
+  it("passes validated comment presentation fields to agent-authenticated writes", async () => {
     const app = await installActor(createApp(), agentActor());
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      authorType: "agent",
+      authorAgentId: "22222222-2222-4222-8222-222222222222",
+      authorUserId: null,
+      body: "Hidden details",
+      presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false },
+      metadata: {
+        version: 1,
+        sections: [{ rows: [{ type: "key_value", label: "Cause", value: "structured_agent_update" }] }],
+      },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+    const metadata = {
+      version: 1,
+      sections: [{ rows: [{ type: "key_value", label: "Cause", value: "structured_agent_update" }] }],
+    };
 
     const res = await request(app)
       .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
       .send({
         body: "Hidden details",
         presentation: { kind: "system_notice", tone: "warning" },
-        metadata: {
-          version: 1,
-          sections: [{ rows: [{ type: "key_value", label: "Cause", value: "covert_channel_attempt" }] }],
-        },
+        metadata,
       });
 
-    expect(res.status).toBe(403);
-    expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    expect(res.status).toBe(201);
+    expect(mockIssueService.addComment).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      "Hidden details",
+      { agentId: "22222222-2222-4222-8222-222222222222", userId: undefined, runId: "run-1" },
+      {
+        authorType: "agent",
+        presentation: { kind: "system_notice", tone: "warning", detailsDefaultOpen: false },
+        metadata,
+      },
+    );
   });
 
   it("rejects invalid comment metadata before writing a comment", async () => {
