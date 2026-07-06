@@ -77,6 +77,15 @@ type EmbeddedPostgresCtor = new (opts: {
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
 
+const DEFAULT_DATABASE_BACKUP_STALE_AFTER_MINUTES = 30;
+const DATABASE_BACKUP_SKIP_ALERT_THRESHOLD = 3;
+
+function readPositiveNumberEnv(name: string): number | null {
+  const raw = process.env[name];
+  if (!raw) return null;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
 
 export interface StartedServer {
   server: ReturnType<typeof createServer>;
@@ -533,22 +542,72 @@ export async function startServer(): Promise<StartedServer> {
     shareClient: createFeedbackTraceShareClientFromConfig(config),
   });
   const backupSettingsSvc = instanceSettingsService(db);
-  let databaseBackupInFlight = false;
+  const databaseBackupStaleAfterMinutes =
+    readPositiveNumberEnv("PAPERCLIP_DB_BACKUP_STALE_AFTER_MINUTES")
+    ?? DEFAULT_DATABASE_BACKUP_STALE_AFTER_MINUTES;
+  const databaseBackupStaleAfterMs = databaseBackupStaleAfterMinutes * 60 * 1000;
+  let databaseBackupInFlight: {
+    runId: symbol;
+    trigger: InstanceDatabaseBackupTrigger;
+    startedAt: Date;
+    startedAtMs: number;
+  } | null = null;
+  let databaseBackupConsecutiveSkips = 0;
   const runServerDatabaseBackup = async (
     trigger: InstanceDatabaseBackupTrigger,
   ): Promise<InstanceDatabaseBackupRunResult | null> => {
     if (databaseBackupInFlight) {
-      const message = "Database backup already in progress";
-      if (trigger === "scheduled") {
-        logger.warn("Skipping scheduled database backup because a previous backup is still running");
-        return null;
+      const ageMs = Date.now() - databaseBackupInFlight.startedAtMs;
+      if (ageMs > databaseBackupStaleAfterMs) {
+        logger.error(
+          {
+            trigger,
+            staleTrigger: databaseBackupInFlight.trigger,
+            staleStartedAt: databaseBackupInFlight.startedAt.toISOString(),
+            staleAgeMs: ageMs,
+            staleAfterMs: databaseBackupStaleAfterMs,
+          },
+          "Clearing stale database backup in-flight guard",
+        );
+        databaseBackupInFlight = null;
+        databaseBackupConsecutiveSkips = 0;
+      } else {
+        const message = "Database backup already in progress";
+        if (trigger === "scheduled") {
+          databaseBackupConsecutiveSkips += 1;
+          logger.warn(
+            {
+              consecutiveSkips: databaseBackupConsecutiveSkips,
+              inFlightTrigger: databaseBackupInFlight.trigger,
+              inFlightStartedAt: databaseBackupInFlight.startedAt.toISOString(),
+              inFlightAgeMs: ageMs,
+              staleAfterMs: databaseBackupStaleAfterMs,
+            },
+            "Skipping scheduled database backup because a previous backup is still running",
+          );
+          if (databaseBackupConsecutiveSkips >= DATABASE_BACKUP_SKIP_ALERT_THRESHOLD) {
+            logger.error(
+              {
+                consecutiveSkips: databaseBackupConsecutiveSkips,
+                inFlightTrigger: databaseBackupInFlight.trigger,
+                inFlightStartedAt: databaseBackupInFlight.startedAt.toISOString(),
+                inFlightAgeMs: ageMs,
+                staleAfterMs: databaseBackupStaleAfterMs,
+              },
+              "Database backup has skipped repeatedly because a previous backup is still running",
+            );
+          }
+          return null;
+        }
+        throw conflict(message);
       }
-      throw conflict(message);
     }
 
-    databaseBackupInFlight = true;
+    const runId = Symbol("databaseBackupRun");
     const startedAt = new Date();
     const startedAtMs = Date.now();
+    databaseBackupInFlight = { runId, trigger, startedAt, startedAtMs };
+    databaseBackupConsecutiveSkips = 0;
     const label = trigger === "scheduled" ? "Automatic" : "Manual";
     try {
       logger.info({ backupDir: config.databaseBackupDir, trigger }, `${label} database backup starting`);
@@ -561,6 +620,7 @@ export async function startServer(): Promise<StartedServer> {
         backupDir: config.databaseBackupDir,
         retention,
         filenamePrefix: "paperclip",
+        backupTimeoutSeconds: databaseBackupStaleAfterMs / 1000,
       });
       const finishedAt = new Date();
       const response: InstanceDatabaseBackupRunResult = {
@@ -589,7 +649,9 @@ export async function startServer(): Promise<StartedServer> {
       logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
       throw err;
     } finally {
-      databaseBackupInFlight = false;
+      if (databaseBackupInFlight?.runId === runId) {
+        databaseBackupInFlight = null;
+      }
     }
   };
   const pluginWorkerManager = createPluginWorkerManager();

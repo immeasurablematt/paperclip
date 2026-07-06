@@ -1,8 +1,21 @@
-import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import {
+  closeSync,
+  createReadStream,
+  createWriteStream,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
 import { open as openFile } from "node:fs/promises";
+import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -28,6 +41,7 @@ export type RunDatabaseBackupOptions = {
   excludeTables?: string[];
   nullifyColumns?: Record<string, string[]>;
   backupEngine?: "auto" | "pg_dump" | "javascript";
+  backupTimeoutSeconds?: number;
 };
 
 export type RunDatabaseBackupResult = {
@@ -70,6 +84,8 @@ const DEFAULT_BACKUP_WRITE_BUFFER_BYTES = 1024 * 1024;
 const BACKUP_DATA_CURSOR_ROWS = 100;
 const BACKUP_CLI_STDERR_BYTES = 64 * 1024;
 const BACKUP_BREAKPOINT_DETECT_BYTES = 64 * 1024;
+const DEFAULT_BACKUP_TIMEOUT_SECONDS = 30 * 60;
+const MIN_BACKUP_TIMEOUT_MS = 100;
 
 const STATEMENT_BREAKPOINT = "-- paperclip statement breakpoint 69f6f3f1-42fd-46a6-bf17-d1d85f8f3900";
 
@@ -284,12 +300,131 @@ async function waitForChildExit(child: ReturnType<typeof spawn>, label: string):
   }
 }
 
+function resolveBackupTimeoutMs(timeoutSeconds: number | undefined): number {
+  if (typeof timeoutSeconds !== "number" || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+    return DEFAULT_BACKUP_TIMEOUT_SECONDS * 1000;
+  }
+  return Math.max(MIN_BACKUP_TIMEOUT_MS, Math.ceil(timeoutSeconds * 1000));
+}
+
+function formatTimeout(timeoutMs: number): string {
+  return `${Math.round(timeoutMs / 1000)}s`;
+}
+
+function createBackupTempPath(filePath: string): string {
+  return `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function removeIfExists(filePath: string): void {
+  if (!existsSync(filePath)) return;
+  try {
+    unlinkSync(filePath);
+  } catch {
+    // Preserve the primary backup error when cleanup fails.
+  }
+}
+
+function fsyncPath(filePath: string): void {
+  const fd = openSync(filePath, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function fsyncDirectory(filePath: string): void {
+  let fd: number | null = null;
+  try {
+    fd = openSync(dirname(filePath), "r");
+    fsyncSync(fd);
+  } catch {
+    // Some filesystems reject directory fsync. The file itself was already synced.
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Ignore close errors after best-effort directory fsync.
+      }
+    }
+  }
+}
+
+async function withAbortableTimeout<T>(
+  label: string,
+  timeoutMs: number,
+  run: (signal: AbortSignal) => Promise<T>,
+  onTimeout?: () => void,
+): Promise<T> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    onTimeout?.();
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await run(controller.signal);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`${label} timed out after ${formatTimeout(timeoutMs)}`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function verifyGzipFile(filePath: string, timeoutMs: number): Promise<void> {
+  await withAbortableTimeout(
+    `gzip verification for ${basename(filePath)}`,
+    timeoutMs,
+    (signal) => pipeline(
+      createReadStream(filePath),
+      createGunzip(),
+      new Writable({
+        write(_chunk, _encoding, callback) {
+          callback();
+        },
+      }),
+      { signal },
+    ),
+  );
+}
+
+async function gzipFileAtomic(sourceFile: string, backupFile: string, timeoutMs: number): Promise<void> {
+  const tempBackupFile = createBackupTempPath(backupFile);
+  try {
+    await withAbortableTimeout(
+      `gzip compression for ${basename(backupFile)}`,
+      timeoutMs,
+      (signal) => pipeline(
+        createReadStream(sourceFile),
+        createGzip(),
+        createWriteStream(tempBackupFile, { flags: "wx" }),
+        { signal },
+      ),
+    );
+    fsyncPath(tempBackupFile);
+    await verifyGzipFile(tempBackupFile, timeoutMs);
+    renameSync(tempBackupFile, backupFile);
+    fsyncDirectory(backupFile);
+  } catch (error) {
+    removeIfExists(tempBackupFile);
+    throw error;
+  }
+}
+
 async function runPgDumpBackup(opts: {
   connectionString: string;
   backupFile: string;
   connectTimeout: number;
+  timeoutMs: number;
 }): Promise<void> {
   const pgDumpBin = process.env.PAPERCLIP_PG_DUMP_PATH || "pg_dump";
+  const tempBackupFile = createBackupTempPath(opts.backupFile);
   const child = spawn(
     pgDumpBin,
     [
@@ -308,15 +443,40 @@ async function runPgDumpBackup(opts: {
       },
     },
   );
+  let childExited = false;
+  child.once("exit", () => {
+    childExited = true;
+  });
 
   if (!child.stdout) {
     throw new Error("pg_dump did not expose stdout");
   }
 
-  await Promise.all([
-    pipeline(child.stdout, createGzip(), createWriteStream(opts.backupFile)),
-    waitForChildExit(child, pgDumpBin),
-  ]);
+  try {
+    await withAbortableTimeout(
+      `pg_dump backup for ${basename(opts.backupFile)}`,
+      opts.timeoutMs,
+      (signal) => Promise.all([
+        pipeline(child.stdout!, createGzip(), createWriteStream(tempBackupFile, { flags: "wx" }), { signal }),
+        waitForChildExit(child, pgDumpBin),
+      ]),
+      () => {
+        child.kill("SIGTERM");
+        setTimeout(() => {
+          if (!childExited) {
+            child.kill("SIGKILL");
+          }
+        }, 5_000).unref();
+      },
+    );
+    fsyncPath(tempBackupFile);
+    await verifyGzipFile(tempBackupFile, opts.timeoutMs);
+    renameSync(tempBackupFile, opts.backupFile);
+    fsyncDirectory(opts.backupFile);
+  } catch (error) {
+    removeIfExists(tempBackupFile);
+    throw error;
+  }
 }
 
 async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
@@ -495,6 +655,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   const filenamePrefix = opts.filenamePrefix ?? "paperclip";
   const retention = opts.retention;
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
+  const backupTimeoutMs = resolveBackupTimeoutMs(opts.backupTimeoutSeconds);
   const backupEngine = opts.backupEngine ?? "auto";
   const canUsePgDump = !hasBackupTransforms(opts);
   const excludedTableNames = normalizeTableNameSet(opts.excludeTables);
@@ -520,6 +681,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           connectionString: opts.connectionString,
           backupFile,
           connectTimeout,
+          timeoutMs: backupTimeoutMs,
         });
         await writer.abort();
         const sizeBytes = statSync(backupFile).size;
@@ -530,9 +692,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
           prunedCount,
         };
       } catch (error) {
-        if (existsSync(backupFile)) {
-          try { unlinkSync(backupFile); } catch { /* ignore */ }
-        }
+        removeIfExists(backupFile);
         if (backupEngine === "pg_dump") {
           throw error;
         }
@@ -927,10 +1087,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
     await writer.close();
 
-    // Compress the SQL file with gzip
-    const sqlReadStream = createReadStream(sqlFile);
-    const gzWriteStream = createWriteStream(backupFile);
-    await pipeline(sqlReadStream, createGzip(), gzWriteStream);
+    await gzipFileAtomic(sqlFile, backupFile, backupTimeoutMs);
     unlinkSync(sqlFile);
 
     const sizeBytes = statSync(backupFile).size;
@@ -943,12 +1100,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     };
   } catch (error) {
     await writer.abort();
-    if (existsSync(backupFile)) {
-      try { unlinkSync(backupFile); } catch { /* ignore */ }
-    }
-    if (existsSync(sqlFile)) {
-      try { unlinkSync(sqlFile); } catch { /* ignore */ }
-    }
+    removeIfExists(backupFile);
+    removeIfExists(sqlFile);
     throw error;
   } finally {
     await closeSql();

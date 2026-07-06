@@ -75,6 +75,42 @@ describe("createBufferedTextFileWriter", () => {
 
 describeEmbeddedPostgres("runDatabaseBackup", () => {
   it(
+    "times out stalled pg_dump backups and removes partial output",
+    async () => {
+      const sourceConnectionString = await createTempDatabase();
+      const backupDir = createTempDir("paperclip-db-backup-timeout-");
+      const fakePgDumpPath = path.join(backupDir, "pg_dump-hang.sh");
+      const previousPgDumpPath = process.env.PAPERCLIP_PG_DUMP_PATH;
+
+      fs.writeFileSync(fakePgDumpPath, "#!/bin/sh\nsleep 10\n", "utf8");
+      fs.chmodSync(fakePgDumpPath, 0o755);
+      process.env.PAPERCLIP_PG_DUMP_PATH = fakePgDumpPath;
+
+      try {
+        await expect(
+          runDatabaseBackup({
+            connectionString: sourceConnectionString,
+            backupDir,
+            retention: { dailyDays: 7, weeklyWeeks: 4, monthlyMonths: 1 },
+            filenamePrefix: "paperclip-timeout-test",
+            backupEngine: "pg_dump",
+            backupTimeoutSeconds: 0.1,
+          }),
+        ).rejects.toThrow(/timed out/);
+
+        expect(fs.readdirSync(backupDir).filter((name) => name.startsWith("paperclip-timeout-test"))).toEqual([]);
+      } finally {
+        if (previousPgDumpPath === undefined) {
+          delete process.env.PAPERCLIP_PG_DUMP_PATH;
+        } else {
+          process.env.PAPERCLIP_PG_DUMP_PATH = previousPgDumpPath;
+        }
+      }
+    },
+    20_000,
+  );
+
+  it(
     "backs up and restores large table payloads without materializing one giant string",
     async () => {
       const sourceConnectionString = await createTempDatabase();
